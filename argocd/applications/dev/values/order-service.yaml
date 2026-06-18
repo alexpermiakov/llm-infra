@@ -1,0 +1,26 @@
+# Order Service Helm Values for Dev Environment
+# Normal service with slow memory leak and periodic CPU batch spikes
+
+app:
+  name: order-service
+  image: idp/order-service:v1.0.2
+  port: 8080
+
+resourceProfile: medium
+replicaCount: 1
+
+ingress:
+  enabled: true
+  path: /orders
+  annotations:
+    alb.ingress.kubernetes.io/healthcheck-port: "8080"
+
+cilium:
+  publicPaths:
+    - "/orders"
+    - "/orders/*"
+
+rollout:
+  analysis:
+    minRps: "0"
+

@@ -1,0 +1,83 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ECRManagement",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:CreateRepository",
+        "ecr:DeleteRepository",
+        "ecr:DescribeRepositories",
+        "ecr:ListTagsForResource",
+        "ecr:TagResource",
+        "ecr:UntagResource",
+        "ecr:SetRepositoryPolicy",
+        "ecr:GetRepositoryPolicy",
+        "ecr:DeleteRepositoryPolicy",
+        "ecr:PutImageScanningConfiguration",
+        "ecr:PutImageTagMutability",
+        "ecr:PutLifecyclePolicy",
+        "ecr:GetLifecyclePolicy",
+        "ecr:DeleteLifecyclePolicy",
+        "ecr:DescribeImageReplicationStatus",
+        "ecr:DescribeRegistry"
+      ],
+      "Resource": "arn:aws:ecr:us-west-2:*:repository/idp/*"
+    },
+    {
+      "Sid": "ECRRegistryLevel",
+      "Effect": "Allow",
+      "Action": ["ecr:PutReplicationConfiguration", "ecr:DescribeRegistry"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ECRPush",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage",
+        "ecr:PutImage",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:ListImages"
+      ],
+      "Resource": "arn:aws:ecr:us-west-2:*:repository/idp/*"
+    },
+    {
+      "Sid": "ECRAuthAndList",
+      "Effect": "Allow",
+      "Action": ["ecr:GetAuthorizationToken", "ecr:DescribeRepositories"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "TerraformStateS3",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket",
+        "s3:GetBucketVersioning"
+      ],
+      "Resource": [
+        "arn:aws:s3:::terraform-state-alexidp-tooling",
+        "arn:aws:s3:::terraform-state-alexidp-tooling/*"
+      ]
+    },
+    {
+      "Sid": "OrganizationsDescribe",
+      "Effect": "Allow",
+      "Action": ["organizations:DescribeOrganization"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "STSForAuth",
+      "Effect": "Allow",
+      "Action": ["sts:GetCallerIdentity"],
+      "Resource": "*"
+    }
+  ]
+}
+

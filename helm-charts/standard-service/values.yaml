@@ -1,0 +1,182 @@
+# This is the platform team's golden configuration
+# Platform values (ecrRegistry, wafAclArn) are set per-environment in ArgoCD values files
+
+platform:
+  ecrRegistry: "" # Required: e.g., 123456789.dkr.ecr.us-west-2.amazonaws.com
+  wafAclArn: "" # Required if ingress.wafEnabled: true
+
+app:
+  name: "" # Must be provided by application
+  image: "" # Must be provided by application (e.g., idp/localtime:v1.0.0)
+  externalImage: false # Set to true for non-ECR images (e.g., vllm/vllm-openai)
+  port: 8080
+  team: "" # Team that owns this service (required by policy)
+
+serviceAccount:
+  create: true # Whether to create a service account
+  roleArn: "" # Optional: IAM role ARN for IRSA (AWS API access)
+
+podAnnotations: {} # Optional: additional pod annotations
+
+command: [] # Optional: override container entrypoint
+args: [] # Optional: override container args
+
+imagePullSecrets: [] # Optional: list of secret names for private registries
+
+env: [] # Optional: list of env vars [{name: "FOO", value: "bar"}]
+
+sharedMemory:
+  enabled: false # Enable for GPU workloads that need large /dev/shm (e.g., vLLM)
+  sizeLimit: 8Gi
+
+resourceProfile: small # small, medium, large
+
+resourceProfiles:
+  small:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+  medium:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  large:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 250m
+      memory: 256Mi
+  gpu:
+    limits:
+      cpu: "2"
+      memory: 12Gi
+      nvidia.com/gpu: "1"
+    requests:
+      cpu: "1"
+      memory: 8Gi
+      nvidia.com/gpu: "1"
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/group.name: idp-services
+  path: /
+  pathType: Prefix
+  hosts: []
+  tls: []
+  certificateArn: "" # ACM certificate ARN - set in environment values for HTTPS
+  wafAclArn: ""
+  wafEnabled: true
+
+healthCheck:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  seccompProfile:
+    type: RuntimeDefault # PCI-DSS 2.2: Secure container runtime profile
+
+monitoring:
+  enabled: true
+  prometheus:
+    scrape: true
+    port: 8080
+    path: /metrics
+
+autoscaling:
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+highAvailability:
+  enabled: true
+  spreadAcrossNodes: true
+
+networkPolicy:
+  enabled: true
+  vpcCidr: "10.0.0.0/16"
+  # Default deny + explicit allow pattern (PCI-DSS 1.3, SOC2 CC6.6)
+  # Creates two NetworkPolicies:
+  #   1. default-deny (blocks all traffic)
+  #   2. explicit-allow (allows only specified traffic)
+  additionalEgressRules: []
+
+# Progressive delivery with Argo Rollouts
+rollout:
+  strategy: canary # canary or blueGreen
+  autoPromote: false # For blueGreen: auto-promote after analysis passes
+  analysis:
+    enabled: true # Run analysis during rollout
+    minRps: "0.1" # Throughput floor for request-throughput analysis template
+    count: "5" # blueGreen prePromotion gate: metric samples before promoting (must be finite)
+    backgroundCount: "20" # canary background analysis: ~10m of 30s samples
+  prePromotionAnalysis: true # For blueGreen: run analysis before promoting
+
+nodeSelector: {}
+tolerations: []
+
+# Cilium network policy / authorization
+# mTLS is provided cluster-wide by Cilium WireGuard, not per-service.
+# Compliance: PCI-DSS 4.2, SOC2 CC6.1, HIPAA §164.312(e)
+cilium:
+  enabled: true # Emit a CiliumNetworkPolicy for this service
+
+  # Allow traffic from pods in the same namespace
+  allowSameNamespace: true
+
+  # Public HTTP paths reachable from outside the cluster (in addition to /health, /ready, etc.)
+  publicPaths: []
+  # publicPaths:
+  #   - "/inventory"
+  #   - "/inventory/*"
+
+  # Allow traffic from specific namespaces (identity-based, not IP-based)
+  # allowFromNamespaces:
+  #   - "frontend"
+  #   - "api-gateway"
+
+  # Allow traffic from specific service accounts (most restrictive)
+  # allowFromServices:
+  #   - namespace: "frontend"
+  #     serviceAccount: "web-frontend"
+
+  # Additional custom ingress rules (raw CiliumNetworkPolicy ingress entries)
+  # additionalIngress: []
+

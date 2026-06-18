@@ -1,0 +1,46 @@
+# LLM Client - lightweight Go service that proxies requests to vLLM inference server
+
+app:
+  name: llm-client
+  image: idp/llm-client:v1.0.0
+  port: 8080
+
+resourceProfile: small
+replicaCount: 1
+
+env:
+  # vLLM is published on the chart's standard Service port (80); the container's
+  # 8000 is the targetPort. Use 80 here, not 8000, or requests time out.
+  - name: VLLM_URL
+    value: "http://vllm-inference.vllm-inference.svc.cluster.local:80"
+  - name: VLLM_MODEL
+    value: "facebook/opt-125m"
+
+ingress:
+  enabled: true
+  path: /ask
+  annotations:
+    alb.ingress.kubernetes.io/healthcheck-port: "8080"
+
+cilium:
+  publicPaths:
+    - "/ask"
+    - "/ask/*"
+
+networkPolicy:
+  # llm-client calls vLLM over HTTP on 8000; the default-deny egress otherwise
+  # only permits DNS + 443, so this dependency must be allowed explicitly.
+  additionalEgressRules:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vllm-inference
+      ports:
+        - protocol: TCP
+          port: 8000
+
+rollout:
+  strategy: canary
+  analysis:
+    enabled: false
+

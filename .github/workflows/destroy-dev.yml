@@ -1,0 +1,378 @@
+name: Destroy Dev
+
+# Kubernetes operators use the Kubernetes API as their source of truth, not
+# Terraform. They create AWS resources imperatively at runtime. Terraform only
+# knows about the cluster itself, not the resources created by controllers inside it.
+#
+# RESOURCES CREATED OUTSIDE TERRAFORM (require manual cleanup):
+#   1. EC2 Instances        - Created by Karpenter autoscaler
+#   2. EBS Volumes          - Created by EBS CSI driver for PVCs
+#   3. Load Balancers       - Created by AWS LB Controller for Ingress/Service
+#   4. Security Groups      - Created by EKS for node-to-node communication
+#   5. Network Interfaces   - Created by VPC CNI for pod networking
+#
+# CLEANUP SEQUENCE (order matters):
+#   1. Scale down Karpenter & ArgoCD → Prevent resource re-creation
+#   2. Delete workloads & NodePools → Terminate nodes gracefully
+#   3. Delete LoadBalancers, Ingresses & PVCs → Trigger AWS cleanup
+#   4. Terminate instances, delete volumes & ENIs → Remove AWS resources
+#   5. Terraform destroy (with retries) → Remove Terraform-managed resources
+#   6. Post-destroy cleanup → Remove any remaining security groups
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to destroy resources for"
+        required: true
+        type: number
+  pull_request:
+    types: [closed]
+
+env:
+  BUCKET_NAME: terraform-state-alexidp-dev
+  TF_VAR_pr_number: ${{ inputs.pr_number || github.event.number }}
+
+jobs:
+  destroy:
+    name: Destroy PR (${{ matrix.region }})
+    runs-on: ubuntu-latest
+    environment: dev
+    strategy:
+      matrix:
+        region:
+          - us-west-2
+          # - us-east-1
+      fail-fast: false
+    env:
+      AWS_REGION: ${{ matrix.region }}
+      TF_VAR_region: ${{ matrix.region }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.3
+          terraform_wrapper: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.1
+        id: oidc
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+          role-duration-seconds: 7200
+
+      - name: Terraform Init (Prepare for Destroy)
+        working-directory: infra/entry
+        run: |
+          terraform init \
+            -backend-config="region=us-west-2" \
+            -backend-config="bucket=${{ env.BUCKET_NAME }}" \
+            -backend-config="key=pr-${{ inputs.pr_number || github.event.number }}/${{ matrix.region }}/state.tfstate" \
+            -backend-config="use_lockfile=true"
+
+      - name: Get EKS Cluster Credentials
+        run: |
+          # Construct cluster name from PR number (matches naming convention in terraform)
+          CLUSTER_NAME="k8s-pr-${{ inputs.pr_number || github.event.number }}"
+          echo "Connecting to cluster: $CLUSTER_NAME"
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region ${{ env.AWS_REGION }} || echo "Cluster not found or already deleted"
+
+      - name: Cleanup Kubernetes Resources
+        continue-on-error: true
+        run: |
+          # Delete validating webhook configurations first (prevents deletion failures)
+          echo "Deleting validating webhook configurations..."
+          kubectl delete validatingwebhookconfiguration --all --ignore-not-found=true || true
+
+          # NUCLEAR OPTION: Delete Karpenter & ArgoCD deployments entirely to prevent resource re-creation
+          echo "Deleting controllers to prevent resource re-creation..."
+          kubectl delete deployment karpenter -n kube-system --ignore-not-found=true || true
+          kubectl delete deployment -n argocd --all --ignore-not-found=true || true
+
+          # Wait briefly for controllers to stop
+          sleep 5
+
+          # Delete workloads and Karpenter provisioners
+          echo "Deleting workloads and Karpenter resources..."
+          kubectl delete deployments,statefulsets,daemonsets -n default --all --timeout=60s || true
+          kubectl delete nodepools --all --timeout=3m --ignore-not-found=true || true
+          kubectl delete ec2nodeclasses --all --timeout=3m --ignore-not-found=true || true
+
+          # Remove finalizers from stuck Karpenter resources
+          echo "Removing finalizers from stuck Karpenter resources..."
+          kubectl get ec2nodeclasses -o name 2>/dev/null | xargs -I {} kubectl patch {} -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
+          kubectl get nodepools -o name 2>/dev/null | xargs -I {} kubectl patch {} -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
+
+          # Delete LoadBalancers, Ingresses, and PVCs
+          echo "Deleting AWS-backed resources..."
+          kubectl delete svc -A -l 'kubernetes.io/service-type=LoadBalancer' --timeout=60s || true
+          kubectl delete ingress -A --all --timeout=60s || true
+          kubectl delete pvc --all -A --timeout=3m || true
+
+          # Remove finalizers from stuck PVCs (kubecost PVCs often get stuck)
+          echo "Removing finalizers from stuck PVCs..."
+          kubectl get pvc -A -o json 2>/dev/null | jq -r '.items[] | "\(.metadata.namespace) \(.metadata.name)"' | \
+            while read -r NS NAME; do
+              [ -z "$NS" ] && continue
+              kubectl patch pvc "$NAME" -n "$NS" -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
+            done
+
+          # Force delete managed namespaces (prevents 20+ min hangs during Terraform destroy)
+          echo "Force-deleting managed namespaces..."
+          for NS in argocd argo-rollouts kyverno monitoring kubecost external-secrets falco-system velero; do
+            if kubectl get namespace "$NS" &>/dev/null; then
+              echo "Deleting namespace: $NS"
+              
+              # Delete all resources in namespace
+              kubectl delete all -n "$NS" --all --timeout=30s --ignore-not-found=true || true
+              kubectl delete pvc,secrets,configmaps -n "$NS" --all --ignore-not-found=true || true
+              
+              # Immediately remove finalizers (don't wait for delete to complete)
+              echo "Removing finalizers from namespace: $NS"
+              kubectl get namespace "$NS" -o json 2>/dev/null | \
+                jq '.spec.finalizers = []' | \
+                kubectl replace --raw "/api/v1/namespaces/$NS/finalize" -f - 2>/dev/null || true
+              
+              # Background delete without waiting (will complete after finalizer removal)
+              kubectl delete namespace "$NS" --ignore-not-found=true &
+            fi
+          done
+
+          # Wait a moment for background deletes to process
+          sleep 5
+
+          echo "Waiting 30s for AWS resource cleanup..."
+          sleep 30
+
+      - name: Cleanup AWS Resources
+        continue-on-error: true
+        env:
+          CLUSTER_NAME: k8s-pr-${{ inputs.pr_number || github.event.number }}
+        run: |
+          # Get VPC ID from Terraform or cluster resources
+          cd infra/entry
+          VPC_ID=$(terraform output -raw vpc_id 2>/dev/null | grep -E '^vpc-[a-f0-9]+$' || echo "")
+          cd ../..
+
+          # Fallback: Get VPC from cluster-tagged security groups if Terraform state is gone
+          if [ -z "$VPC_ID" ]; then
+            echo "Terraform state unavailable, finding VPC from cluster resources..."
+            VPC_ID=$(aws ec2 describe-security-groups \
+              --filters "Name=tag:karpenter.sh/discovery,Values=$CLUSTER_NAME" \
+              --query 'SecurityGroups[0].VpcId' \
+              --output text 2>/dev/null | grep -E '^vpc-[a-f0-9]+$' || echo "")
+          fi
+
+          if [ -z "$VPC_ID" ]; then
+            echo "VPC not found (cluster may already be destroyed), skipping AWS cleanup"
+            exit 0
+          fi
+
+          echo "=== Cleaning up AWS resources in VPC: $VPC_ID ==="
+
+          # 1. Terminate ALL EC2 instances (including those not from Karpenter)
+          echo "Terminating EC2 instances..."
+          INSTANCES=$(aws ec2 describe-instances \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+
+          if [ -n "$INSTANCES" ]; then
+            echo "Terminating instances: $INSTANCES"
+            aws ec2 terminate-instances --instance-ids $INSTANCES || true
+            echo "Waiting 45s for instances to terminate and release ENIs..."
+            sleep 45
+          else
+            echo "No instances to terminate"
+          fi
+
+          # 2. Delete available EBS volumes
+          echo "Deleting EBS volumes..."
+          VOLUMES=$(aws ec2 describe-volumes \
+            --filters "Name=tag:kubernetes.io/cluster/$CLUSTER_NAME,Values=owned" "Name=status,Values=available" \
+            --query 'Volumes[].VolumeId' \
+            --output text)
+          for VOL in $VOLUMES; do
+            [ -z "$VOL" ] && continue
+            echo "Deleting volume: $VOL"
+            aws ec2 delete-volume --volume-id "$VOL" || true
+          done
+
+          # 3. Delete orphaned ENIs (VPC CNI, etc. — NOT Firehose PrivateLink, those are
+          # handled in the Terraform Destroy step after Firehose streams are destroyed)
+          echo "Deleting orphaned ENIs..."
+          ENIS=$(aws ec2 describe-network-interfaces \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query "NetworkInterfaces[?Status!='in-use'].[NetworkInterfaceId]" \
+            --output text)
+          for ENI_ID in $ENIS; do
+            [ -z "$ENI_ID" ] && continue
+            echo "Deleting ENI: $ENI_ID"
+            aws ec2 delete-network-interface --network-interface-id "$ENI_ID" || true
+          done
+
+          # 4. Best-effort delete of orphan SGs only.
+          # IMPORTANT: do NOT rely on tags to infer Terraform ownership. Many EKS SGs
+          # created by Terraform modules do not carry ManagedBy=Terraform tags.
+          echo "Deleting orphan security groups (safe mode)..."
+
+          # Build a set of SG IDs currently tracked in Terraform state, then skip them.
+          TF_SGS=$(terraform state list 2>/dev/null | grep 'aws_security_group' | while read -r RES; do
+            terraform state show "$RES" 2>/dev/null | awk '$1 == "id" && $2 == "=" {print $3; exit}'
+          done | tr '\n' ' ')
+
+          ALL_SGS=$(aws ec2 describe-security-groups \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query "SecurityGroups[?GroupName!='default'].GroupId" \
+            --output text)
+
+          for SG_ID in $ALL_SGS; do
+            [ -z "$SG_ID" ] && continue
+
+            # Skip SGs Terraform will destroy itself.
+            if echo " $TF_SGS " | grep -q " $SG_ID "; then
+              continue
+            fi
+
+            # Skip SGs still attached to ENIs.
+            ENI_COUNT=$(aws ec2 describe-network-interfaces \
+              --filters "Name=group-id,Values=$SG_ID" \
+              --query 'length(NetworkInterfaces)' \
+              --output text 2>/dev/null || echo "0")
+            [ "$ENI_COUNT" != "0" ] && continue
+
+            # Skip SGs attached to ALB/NLB (elbv2).
+            ELBV2_COUNT=$(aws elbv2 describe-load-balancers \
+              --query "length(LoadBalancers[?VpcId=='$VPC_ID' && contains(SecurityGroups, '$SG_ID')])" \
+              --output text 2>/dev/null || echo "0")
+            [ "$ELBV2_COUNT" != "0" ] && continue
+
+            # Skip SGs attached to Classic ELB.
+            ELB_COUNT=$(aws elb describe-load-balancers \
+              --query "length(LoadBalancerDescriptions[?VPCId=='$VPC_ID' && contains(SecurityGroups, '$SG_ID')])" \
+              --output text 2>/dev/null || echo "0")
+            [ "$ELB_COUNT" != "0" ] && continue
+
+            # Remove any residual rules and delete.
+            aws ec2 revoke-security-group-ingress --group-id "$SG_ID" \
+              --ip-permissions "$(aws ec2 describe-security-groups --group-ids "$SG_ID" --query 'SecurityGroups[0].IpPermissions' --output json)" 2>/dev/null || true
+            aws ec2 revoke-security-group-egress --group-id "$SG_ID" \
+              --ip-permissions "$(aws ec2 describe-security-groups --group-ids "$SG_ID" --query 'SecurityGroups[0].IpPermissionsEgress' --output json)" 2>/dev/null || true
+
+            echo "Deleting security group: $SG_ID"
+            aws ec2 delete-security-group --group-id "$SG_ID" || true
+          done
+
+          echo "Terraform will now destroy cluster and remaining resources..."
+
+      - name: Remove Helm Releases from Terraform State
+        working-directory: infra/entry
+        continue-on-error: true
+        run: |
+          # CRITICAL: Remove Helm releases from state BEFORE destroy
+          # This prevents "Error uninstalling release" failures when namespaces are already deleted
+          echo "Removing Helm releases and namespaces from Terraform state..."
+
+          # Security (Falco, Kyverno)
+          terraform state rm -lock=false 'module.security.helm_release.falco' 2>/dev/null || true
+          terraform state rm -lock=false 'module.security.helm_release.kyverno' 2>/dev/null || true
+
+          # ArgoCD & Argo Rollouts
+          terraform state rm -lock=false 'module.argocd.helm_release.argocd' 2>/dev/null || true
+          terraform state rm -lock=false 'module.argocd.kubernetes_namespace_v1.argocd' 2>/dev/null || true
+          terraform state rm -lock=false 'module.argo_rollouts.helm_release.argo_rollouts' 2>/dev/null || true
+          terraform state rm -lock=false 'module.argo_rollouts.kubernetes_namespace_v1.argo_rollouts' 2>/dev/null || true
+
+          # Monitoring stack
+          terraform state rm -lock=false 'module.monitoring.helm_release.kube-prometheus-stack' 2>/dev/null || true
+          terraform state rm -lock=false 'module.monitoring.helm_release.loki' 2>/dev/null || true
+          terraform state rm -lock=false 'module.monitoring.helm_release.promtail' 2>/dev/null || true
+          terraform state rm -lock=false 'module.monitoring.kubernetes_namespace_v1.monitoring' 2>/dev/null || true
+
+          # External Secrets
+          terraform state rm -lock=false 'module.external_secrets.helm_release.external_secrets' 2>/dev/null || true
+          terraform state rm -lock=false 'module.external_secrets.kubernetes_namespace_v1.external_secrets' 2>/dev/null || true
+          terraform state rm -lock=false 'module.external_secrets.kubectl_manifest.secret_store' 2>/dev/null || true
+          terraform state rm -lock=false 'module.external_secrets.kubectl_manifest.github_app_external_secret' 2>/dev/null || true
+
+          # Backup (Velero)
+          terraform state rm -lock=false 'module.backup.helm_release.velero' 2>/dev/null || true
+          terraform state rm -lock=false 'module.backup.kubectl_manifest.backup_schedule' 2>/dev/null || true
+
+          # Cost (Kubecost)
+          terraform state rm -lock=false 'module.cost.helm_release.kubecost' 2>/dev/null || true
+          terraform state rm -lock=false 'module.cost.kubernetes_namespace_v1.kubecost' 2>/dev/null || true
+
+          # List remaining state to verify cleanup
+          echo "Remaining Helm releases in state:"
+          terraform state list 2>/dev/null | grep -E 'helm_release|kubectl_manifest' || echo "None found"
+          echo "Terraform state cleanup complete"
+
+      - name: Refresh AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.1
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+          role-duration-seconds: 7200
+
+      - name: Terraform Destroy
+        working-directory: infra/entry
+        env:
+          TF_VARS: -var-file=regions/${{ matrix.region }}.tfvars
+        run: |
+          VPC_ID=$(terraform output -raw vpc_id 2>/dev/null | grep -E '^vpc-[a-f0-9]+$' || echo "")
+
+          # Attempt 1: Terraform destroy (generic). Specialized cleanup for
+          # previously-optional services has been removed for the simplified demo.
+          echo "=== Terraform destroy (attempt 1) ==="
+          timeout 1800 terraform destroy -auto-approve -lock=false -refresh=false $TF_VARS || true
+
+          # Attempt 2: SG blockers are gone, this should clean up the rest.
+          echo "=== Terraform destroy (attempt 2) ==="
+          timeout 2700 terraform destroy -auto-approve -lock=false -refresh=false $TF_VARS && exit 0
+
+          echo "Attempt 2 failed, retrying after ENI cleanup..."
+
+          # Print what is still blocking SG deletion for easier diagnosis.
+          if [ -n "$VPC_ID" ]; then
+            echo "Listing security groups in VPC for diagnosis..."
+            aws ec2 describe-security-groups \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'SecurityGroups[].{Id:GroupId,Name:GroupName,Desc:Description}' \
+              --output table 2>/dev/null || true
+          fi
+
+          # Final ENI sweep + attempt 3 in case detachments were slow
+          if [ -n "$VPC_ID" ]; then
+            aws ec2 describe-network-interfaces \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query "NetworkInterfaces[?Status!='in-use'].NetworkInterfaceId" \
+              --output text 2>/dev/null | tr '\t' '\n' | while read -r ENI_ID; do
+                [ -z "$ENI_ID" ] && continue
+                aws ec2 delete-network-interface --network-interface-id "$ENI_ID" 2>/dev/null || true
+              done
+          fi
+          echo "=== Terraform destroy (attempt 3) ==="
+            timeout 2700 terraform destroy -auto-approve -lock=false -refresh=false $TF_VARS
+
+      - name: Delete Terraform State from S3
+        working-directory: infra/entry
+        run: |
+          PR_NUMBER=${{ inputs.pr_number || github.event.number }}
+          REGION=${{ matrix.region }}
+          BUCKET=${{ env.BUCKET_NAME }}
+          PREFIX="pr-$PR_NUMBER/$REGION"
+
+          echo "Deleting Terraform state from S3: s3://$BUCKET/$PREFIX/"
+          aws s3 rm "s3://$BUCKET/$PREFIX/" --recursive
+          echo "Terraform state cleanup completed for PR $PR_NUMBER ($REGION)"
+

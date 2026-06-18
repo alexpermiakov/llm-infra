@@ -1,0 +1,52 @@
+{{- if .Values.networkPolicy.enabled }}
+# NetworkPolicy - PCI-DSS 1.3, SOC2 CC6.6
+# Default behavior: DENY ALL ingress/egress traffic
+# Only explicitly defined rules below are allowed
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.app.name }}
+  labels:
+    app: {{ .Values.app.name }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Values.app.name }}
+  policyTypes:
+    - Ingress
+    - Egress
+  # All traffic not matching rules below is DENIED
+  ingress:
+    # Allow traffic from ALB (VPC CIDR) when using target-type: ip
+    - from:
+        - ipBlock:
+            cidr: {{ .Values.networkPolicy.vpcCidr }}
+    # Allow traffic from ingress controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+    # Allow traffic from same namespace
+    - from:
+        - podSelector: {}
+  egress:
+    # Allow DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+    # Allow all HTTPS outbound
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- with .Values.networkPolicy.additionalEgressRules }}
+    # In-cluster egress dependencies (e.g. calling another service over plain HTTP)
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,89 @@
+{{- if .Values.cilium.enabled }}
+# CiliumNetworkPolicy - L3/L4/L7 zero-trust authorization
+# Compliance: PCI-DSS 1.3, SOC2 CC6.6
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ .Values.app.name }}-authz
+  labels:
+    app: {{ .Values.app.name }}
+    team: {{ .Values.app.team | default "platform" }}
+    chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+    managedBy: platform-team
+  annotations:
+    compliance/pci-dss: "1.3 - Prohibit unauthorized traffic"
+    compliance/soc2: "CC6.6 - Boundary protection"
+spec:
+  endpointSelector:
+    matchLabels:
+      app: {{ .Values.app.name }}
+  ingress:
+    {{- if .Values.cilium.allowSameNamespace }}
+    # Allow traffic from pods in the same namespace
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Release.Namespace }}
+    {{- end }}
+
+    {{- if .Values.cilium.allowFromNamespaces }}
+    # Allow traffic from specified namespaces
+    - fromEndpoints:
+        {{- range .Values.cilium.allowFromNamespaces }}
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ . | quote }}
+        {{- end }}
+    {{- end }}
+
+    {{- if .Values.cilium.allowFromServices }}
+    # Allow traffic from specific service accounts
+    - fromEndpoints:
+        {{- range .Values.cilium.allowFromServices }}
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .namespace | quote }}
+            k8s:io.cilium.k8s.policy.serviceaccount: {{ .serviceAccount | quote }}
+        {{- end }}
+    {{- end }}
+
+    # Allow ALB / kubelet health-checks and any explicitly public HTTP paths
+    - fromEntities:
+        - world
+        - cluster
+      toPorts:
+        - ports:
+            - port: {{ .Values.app.port | quote }}
+              protocol: TCP
+          rules:
+            http:
+              - method: "GET"
+                path: "/health"
+              - method: "GET"
+                path: "/ready"
+              - method: "GET"
+                path: "/healthz"
+              - method: "GET"
+                path: "/readyz"
+              - method: "GET"
+                path: "/livez"
+              {{- range .Values.cilium.publicPaths }}
+              - method: "GET"
+                path: {{ . | quote }}
+              {{- end }}
+
+    # Allow Prometheus scraping from monitoring namespace
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: monitoring
+      toPorts:
+        - ports:
+            - port: {{ .Values.app.port | quote }}
+              protocol: TCP
+          rules:
+            http:
+              - method: "GET"
+                path: "/metrics"
+
+    {{- if .Values.cilium.additionalIngress }}
+    # Additional custom ingress rules
+    {{- toYaml .Values.cilium.additionalIngress | nindent 4 }}
+    {{- end }}
+{{- end }}

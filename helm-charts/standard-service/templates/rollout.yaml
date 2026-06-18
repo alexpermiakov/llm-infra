@@ -1,0 +1,194 @@
+{{- $canaryStrategy := eq .Values.rollout.strategy "canary" }}
+{{- $albCanary := and $canaryStrategy .Values.ingress.enabled }}
+{{- if and $canaryStrategy (not $albCanary) }}
+{{- fail "Canary rollouts require ingress.enabled=true (ALB traffic routing)." }}
+{{- end }}
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ .Values.app.name }}
+  labels:
+    app: {{ .Values.app.name }}
+    team: {{ .Values.app.team | default "platform" }}
+    chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+    managedBy: platform-team
+spec:
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: {{ .Values.app.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.app.name }}
+        team: {{ .Values.app.team | default "platform" }}
+      annotations:
+      {{- if .Values.monitoring.enabled }}
+        prometheus.io/scrape: {{ .Values.monitoring.prometheus.scrape | quote }}
+        prometheus.io/port: {{ .Values.monitoring.prometheus.port | quote }}
+        prometheus.io/path: {{ .Values.monitoring.prometheus.path | quote }}
+      {{- end }}
+      {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ .Values.app.name }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+        runAsUser: {{ .Values.securityContext.runAsUser }}
+        fsGroup: {{ .Values.securityContext.fsGroup }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.sharedMemory.enabled }}
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: {{ .Values.sharedMemory.sizeLimit }}
+      {{- end }}
+      containers:
+      - name: {{ .Values.app.name }}
+        {{- if .Values.app.externalImage }}
+        image: {{ .Values.app.image }}
+        {{- else }}
+        image: {{ required "platform.ecrRegistry is required" .Values.platform.ecrRegistry }}/{{ .Values.app.image }}
+        {{- end }}
+        imagePullPolicy: IfNotPresent
+        {{- with .Values.command }}
+        command:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.args }}
+        args:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .Values.env }}
+        env:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- if .Values.sharedMemory.enabled }}
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        {{- end }}
+        ports:
+        - name: http
+          containerPort: {{ .Values.app.port }}
+          protocol: TCP
+        {{- if .Values.healthCheck.liveness }}
+        livenessProbe:
+          httpGet:
+            path: {{ .Values.healthCheck.liveness.path }}
+            port: {{ .Values.app.port }}
+          initialDelaySeconds: {{ .Values.healthCheck.liveness.initialDelaySeconds }}
+          periodSeconds: {{ .Values.healthCheck.liveness.periodSeconds }}
+          timeoutSeconds: {{ .Values.healthCheck.liveness.timeoutSeconds }}
+          failureThreshold: {{ .Values.healthCheck.liveness.failureThreshold }}
+        {{- end }}
+        {{- if .Values.healthCheck.readiness }}
+        readinessProbe:
+          httpGet:
+            path: {{ .Values.healthCheck.readiness.path }}
+            port: {{ .Values.app.port }}
+          initialDelaySeconds: {{ .Values.healthCheck.readiness.initialDelaySeconds }}
+          periodSeconds: {{ .Values.healthCheck.readiness.periodSeconds }}
+          timeoutSeconds: {{ .Values.healthCheck.readiness.timeoutSeconds }}
+          failureThreshold: {{ .Values.healthCheck.readiness.failureThreshold }}
+        {{- end }}
+        resources:
+          {{- $profile := index .Values.resourceProfiles .Values.resourceProfile }}
+          {{- toYaml $profile | nindent 10 }}
+        securityContext:
+          runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+          runAsUser: {{ .Values.securityContext.runAsUser }}
+          capabilities:
+            drop:
+            {{- range .Values.securityContext.capabilities.drop }}
+            - {{ . }}
+            {{- end }}
+          readOnlyRootFilesystem: {{ .Values.securityContext.readOnlyRootFilesystem }}
+          allowPrivilegeEscalation: false
+          privileged: false
+  strategy:
+    {{- if eq .Values.rollout.strategy "canary" }}
+    canary:
+      # Canary deployment steps
+      steps:
+      - setWeight: 5
+      - pause: { duration: 60s }
+      - setWeight: 20
+      - pause: { duration: 60s }
+      - setWeight: 50
+      - pause: { duration: 120s }
+      - setWeight: 80
+      - pause: { duration: 120s }
+      # Optional: Run analysis at each step
+      {{- if .Values.rollout.analysis.enabled }}
+      analysis:
+        templates:
+        - templateName: success-rate
+          clusterScope: true
+        - templateName: latency-check
+          clusterScope: true
+        - templateName: request-throughput
+          clusterScope: true
+        args:
+        - name: service-name
+          value: {{ .Values.app.name }}-canary
+        - name: namespace
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: min-rps
+          value: {{ .Values.rollout.analysis.minRps | default "0.1" | quote }}
+        - name: count
+          value: {{ .Values.rollout.analysis.backgroundCount | default "20" | quote }}
+      {{- end }}
+      # With ALB traffic routing, stable pods are kept at full count by default
+      # (ALB weights control traffic %, not pod ratios). Enable dynamicStableScale
+      # to scale stable down proportionally as canary weight increases, saving
+      # capacity mid-rollout. Safe because ALB still enforces the exact traffic split.
+      dynamicStableScale: {{ .Values.rollout.dynamicStableScale | default false }}
+      # Traffic management via service
+      canaryService: {{ .Values.app.name }}-canary
+      stableService: {{ .Values.app.name }}
+      trafficRouting:
+        alb:
+          ingress: {{ .Values.app.name }}
+          servicePort: {{ .Values.service.port }}
+    {{- else if eq .Values.rollout.strategy "blueGreen" }}
+    blueGreen:
+      activeService: {{ .Values.app.name }}
+      previewService: {{ .Values.app.name }}-preview
+      autoPromotionEnabled: {{ .Values.rollout.autoPromote | default false }}
+      {{- if .Values.rollout.prePromotionAnalysis }}
+      prePromotionAnalysis:
+        templates:
+        - templateName: success-rate
+          clusterScope: true
+        - templateName: latency-check
+          clusterScope: true
+        - templateName: request-throughput
+          clusterScope: true
+        args:
+        - name: service-name
+          value: {{ .Values.app.name }}-preview
+        - name: namespace
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: min-rps
+          value: {{ .Values.rollout.analysis.minRps | default "0.1" | quote }}
+        - name: count
+          value: {{ .Values.rollout.analysis.count | default "5" | quote }}
+      {{- end }}
+      scaleDownDelaySeconds: 30
+    {{- end }}

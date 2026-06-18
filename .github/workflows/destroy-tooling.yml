@@ -1,0 +1,46 @@
+name: Destroy Tooling
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-west-2
+  BUCKET_NAME: terraform-state-alexidp-tooling
+
+jobs:
+  destroy:
+    name: Destroy Tooling Account
+    runs-on: ubuntu-latest
+    environment: tooling
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.1
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.3
+
+      - name: Terraform Init
+        working-directory: infra/tooling
+        run: |
+          terraform init \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="bucket=${{ env.BUCKET_NAME }}" \
+            -backend-config="key=tooling/state.tfstate"
+
+      - name: Terraform Destroy
+        working-directory: infra/tooling
+        run: terraform destroy -auto-approve
+

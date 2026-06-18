@@ -1,0 +1,172 @@
+name: Provision Dev
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# One provision run per PR at a time. Without this, a new push starts a second run
+# that races the first on the same Terraform state — which can orphan a cluster and
+# surface as "ResourceInUseException: Cluster already exists".
+concurrency:
+  group: provision-dev-${{ github.event.number || github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUCKET_NAME: terraform-state-alexidp-dev
+  TF_VAR_pr_number: ${{ github.event.number }}
+  TF_VAR_environment: dev
+
+jobs:
+  # Cheap, fast guardrail: lint + unit-test the golden-path Helm chart BEFORE
+  # spending time and money provisioning a real EKS cluster. If it fails, the
+  # provision job below is skipped.
+  chart-tests:
+    uses: ./.github/workflows/platform-tests.yaml
+
+  provision:
+    name: Provision PR Cluster (${{ matrix.region }})
+    needs: chart-tests
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        region:
+          - us-west-2
+          # - us-east-1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.1
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
+          audience: sts.amazonaws.com
+          role-duration-seconds: 7200
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.3
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: infra/entry
+        run: |
+          terraform init \
+            -backend-config="region=us-west-2" \
+            -backend-config="bucket=${{ env.BUCKET_NAME }}" \
+            -backend-config="key=pr-${{ github.event.number }}/${{ matrix.region }}/state.tfstate"
+
+      - name: Terraform Apply - VPC First
+        working-directory: infra/entry
+        run: |
+          terraform apply -auto-approve \
+            -var-file=regions/${{ matrix.region }}.tfvars \
+            -target=module.vpc \
+            -var='admin_role_arns=${{ vars.ADMIN_ROLE_ARNS }}' \
+            -var="target_branch=${{ github.head_ref || github.ref_name }}" \
+            -var="ecr_account_id=${{ vars.ECR_ACCOUNT_ID }}"
+
+      - name: Refresh AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.1
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
+          audience: sts.amazonaws.com
+          role-duration-seconds: 7200
+
+      - name: Terraform Apply - Full
+        id: tf_apply_full
+        working-directory: infra/entry
+        env:
+          TF_VAR_github_app_id: ${{ secrets.ARGOCD_GITHUB_APP_ID }}
+          TF_VAR_github_app_installation_id: ${{ secrets.ARGOCD_GITHUB_APP_INSTALLATION_ID }}
+          TF_VAR_github_app_private_key: ${{ secrets.ARGOCD_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          terraform apply -auto-approve \
+            -var-file=regions/${{ matrix.region }}.tfvars \
+            -var='admin_role_arns=${{ vars.ADMIN_ROLE_ARNS }}' \
+            -var="target_branch=${{ github.head_ref || github.ref_name }}" \
+            -var="ecr_account_id=${{ vars.ECR_ACCOUNT_ID }}"
+
+      - name: Get Cluster Credentials
+        working-directory: infra/entry
+        run: |
+          CLUSTER_NAME=$(terraform output -raw cluster_name)
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region ${{ matrix.region }}
+
+      - name: Wait for ALB and Get URL
+        id: alb
+        run: |
+          echo "Waiting for ALB to be provisioned..."
+          for i in {1..30}; do
+            ALB_URL=$(kubectl get ingress -A -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            if [ -n "$ALB_URL" ]; then
+              echo "url=http://$ALB_URL" >> $GITHUB_OUTPUT
+              echo "ALB URL: http://$ALB_URL"
+              exit 0
+            fi
+            echo "Attempt $i/30: ALB not ready, waiting 10s..."
+            sleep 10
+          done
+          echo "url=pending" >> $GITHUB_OUTPUT
+          echo "ALB not ready after 5 minutes"
+
+      - name: Comment PR with Cluster Info
+        if: github.event_name == 'pull_request' && matrix.region == 'us-west-2'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const albUrl = '${{ steps.alb.outputs.url }}';
+            const region = '${{ matrix.region }}';
+
+            const body = `## 🚀 Dev Cluster Deployed (${region})
+
+            | Resource | URL |
+            |----------|-----|
+            | **ALB Endpoint** | ${albUrl} |
+            | **Inventory API** | ${albUrl}/inventory |
+            | **Notification Service** | ${albUrl}/notifications |
+            | **Order Service** | ${albUrl}/orders |
+            | **Payment Processor** | ${albUrl}/payment |
+            | **Recommendation Engine** | ${albUrl}/recommendations |
+            | **Shipping Calculator** | ${albUrl}/shipping |
+
+            `;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && 
+              comment.body.includes('🚀 Dev Cluster Deployed')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+

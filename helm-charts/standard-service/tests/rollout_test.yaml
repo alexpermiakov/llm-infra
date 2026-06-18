@@ -1,0 +1,87 @@
+suite: standard-service rollout strategy + pod hardening
+templates:
+  - templates/rollout.yaml
+tests:
+  - it: renders an Argo Rollout (not a plain Deployment)
+    set:
+      app.name: test-svc
+      app.image: idp/test-svc:v1.0.0
+      platform.ecrRegistry: 1234.dkr.ecr.us-west-2.amazonaws.com
+      ingress.enabled: true
+    asserts:
+      - isKind:
+          of: Rollout
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: 1234.dkr.ecr.us-west-2.amazonaws.com/idp/test-svc:v1.0.0
+
+  - it: uses the canary strategy with the platform's standard weight steps
+    set:
+      app.name: test-svc
+      app.image: idp/test-svc:v1.0.0
+      platform.ecrRegistry: 1234.dkr.ecr.us-west-2.amazonaws.com
+      rollout.strategy: canary
+      ingress.enabled: true
+    asserts:
+      - exists:
+          path: spec.strategy.canary
+      - notExists:
+          path: spec.strategy.blueGreen
+      - equal:
+          path: spec.strategy.canary.steps[0].setWeight
+          value: 5
+      - equal:
+          path: spec.strategy.canary.canaryService
+          value: test-svc-canary
+      - equal:
+          path: spec.strategy.canary.stableService
+          value: test-svc
+
+  - it: blocks a canary rollout that has no ingress (no ALB to split traffic)
+    set:
+      app.name: test-svc
+      app.image: idp/test-svc:v1.0.0
+      platform.ecrRegistry: 1234.dkr.ecr.us-west-2.amazonaws.com
+      rollout.strategy: canary
+      ingress.enabled: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "Canary rollouts require ingress.enabled=true (ALB traffic routing)."
+
+  - it: renders the blueGreen strategy with active + preview services
+    set:
+      app.name: test-svc
+      app.image: idp/test-svc:v1.0.0
+      platform.ecrRegistry: 1234.dkr.ecr.us-west-2.amazonaws.com
+      rollout.strategy: blueGreen
+    asserts:
+      - exists:
+          path: spec.strategy.blueGreen
+      - notExists:
+          path: spec.strategy.canary
+      - equal:
+          path: spec.strategy.blueGreen.activeService
+          value: test-svc
+      - equal:
+          path: spec.strategy.blueGreen.previewService
+          value: test-svc-preview
+
+  - it: enforces the non-negotiable container security context on every service
+    set:
+      app.name: test-svc
+      app.image: idp/test-svc:v1.0.0
+      platform.ecrRegistry: 1234.dkr.ecr.us-west-2.amazonaws.com
+      ingress.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.privileged
+          value: false
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+      - contains:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          content: ALL

@@ -1,0 +1,51 @@
+name: Destroy Prod
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-west-2
+  BUCKET_NAME: terraform-state-alexidp-prod
+  TF_VAR_pr_number: 0
+  TF_VAR_environment: prod
+
+jobs:
+  destroy:
+    name: Destroy Prod Cluster
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.1
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.3
+
+      - name: Terraform Init
+        working-directory: infra/entry
+        run: |
+          terraform init \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="bucket=${{ env.BUCKET_NAME }}" \
+            -backend-config="key=prod/state.tfstate"
+
+      - name: Terraform Destroy
+        working-directory: infra/entry
+        run: |
+          terraform destroy -auto-approve \
+            -var='admin_role_arns=${{ vars.ADMIN_ROLE_ARNS }}' \
+            -var="target_branch=main"
+

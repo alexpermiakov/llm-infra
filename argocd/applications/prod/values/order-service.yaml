@@ -1,0 +1,16 @@
+# Order Service Helm Values for Production Environment
+
+app:
+  name: order-service
+  image: idp/order-service:v1.0.0
+  port: 8080
+
+resourceProfile: large
+replicaCount: 3
+
+ingress:
+  enabled: true
+  path: /orders
+  annotations:
+    alb.ingress.kubernetes.io/healthcheck-port: "8080"
+

@@ -1,0 +1,122 @@
+name: Provision Staging
+
+on:
+  # push:
+  #   branches:
+  #     - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-west-2
+  BUCKET_NAME: terraform-state-alexidp-staging
+  TF_VAR_pr_number: 0
+  TF_VAR_environment: staging
+
+jobs:
+  provision:
+    name: Provision Staging Cluster
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.1
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.3
+
+      - name: Terraform Init
+        working-directory: infra/entry
+        run: |
+          terraform init \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="bucket=${{ env.BUCKET_NAME }}" \
+            -backend-config="key=staging/state.tfstate"
+
+      - name: Terraform Apply - VPC First
+        working-directory: infra/entry
+        run: |
+          terraform apply -auto-approve \
+            -target=module.vpc \
+            -var='admin_role_arns=${{ vars.ADMIN_ROLE_ARNS }}' \
+            -var="target_branch=main" \
+            -var="ecr_account_id=${{ vars.ECR_ACCOUNT_ID }}"
+
+      - name: Refresh AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.1
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Terraform Apply - Full
+        id: tf_apply_full
+        continue-on-error: true
+        working-directory: infra/entry
+        env:
+          TF_VAR_github_app_id: ${{ secrets.ARGOCD_GITHUB_APP_ID }}
+          TF_VAR_github_app_installation_id: ${{ secrets.ARGOCD_GITHUB_APP_INSTALLATION_ID }}
+          TF_VAR_github_app_private_key: ${{ secrets.ARGOCD_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          terraform apply -auto-approve \
+            -var='admin_role_arns=${{ vars.ADMIN_ROLE_ARNS }}' \
+            -var="target_branch=main" \
+            -var="ecr_account_id=${{ vars.ECR_ACCOUNT_ID }}"
+
+      - name: Refresh AWS Credentials for Recovery
+        if: steps.tf_apply_full.outcome == 'failure'
+        uses: aws-actions/configure-aws-credentials@v5.1.1
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Push errored state to backend
+        if: steps.tf_apply_full.outcome == 'failure' && hashFiles('infra/entry/errored.tfstate') != ''
+        working-directory: infra/entry
+        run: terraform state push errored.tfstate
+
+      - name: Terraform Apply - Full (Retry Once)
+        id: tf_apply_full_retry
+        if: steps.tf_apply_full.outcome == 'failure'
+        continue-on-error: true
+        working-directory: infra/entry
+        env:
+          TF_VAR_github_app_id: ${{ secrets.ARGOCD_GITHUB_APP_ID }}
+          TF_VAR_github_app_installation_id: ${{ secrets.ARGOCD_GITHUB_APP_INSTALLATION_ID }}
+          TF_VAR_github_app_private_key: ${{ secrets.ARGOCD_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          terraform apply -auto-approve \
+            -var='admin_role_arns=${{ vars.ADMIN_ROLE_ARNS }}' \
+            -var="target_branch=main" \
+            -var="ecr_account_id=${{ vars.ECR_ACCOUNT_ID }}"
+
+      - name: Fail if Terraform apply still failing
+        if: steps.tf_apply_full.outcome == 'failure' && steps.tf_apply_full_retry.outcome == 'failure'
+        run: exit 1
+
+      - name: Upload errored Terraform state
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: errored-tfstate-staging-${{ github.run_id }}
+          path: infra/entry/errored.tfstate
+          if-no-files-found: ignore
+
+      - name: Get Cluster Credentials
+        working-directory: infra/entry
+        run: |
+          CLUSTER_NAME=$(terraform output -raw cluster_name)
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region ${{ env.AWS_REGION }}

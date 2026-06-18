@@ -1,0 +1,51 @@
+# Tests for the platform's OWN logic — the golden-path Helm chart that every
+# service inherits (rollout strategy, the canary-needs-ingress guard, the
+# enforced pod security context, and the default-deny network policy).
+# These gate changes to the chart so a platform regression can't silently ship
+# to every app team.
+
+name: Platform Tests
+
+on:
+  # Runs as its own visible check on every push to a PR branch.
+  pull_request:
+  # Reused by provision-dev as the pre-provision gate (same suite, blocks the apply).
+  workflow_call:
+  # Safety net for changes that land on main directly (outside the PR flow).
+  push:
+    branches: [main]
+    paths:
+      - "helm-charts/**"
+      - ".github/workflows/platform-tests.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  chart-tests:
+    name: Helm chart lint + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v4.1.4
+
+      - name: Install helm-unittest plugin
+        # Helm 4 requires --verify=false for unsigned plugin sources; the current
+        # helm-unittest manifest (platformHooks) only loads on Helm 4, not 3.x.
+        run: helm plugin install --verify=false https://github.com/helm-unittest/helm-unittest
+
+      - name: Lint chart (with representative values)
+        run: |
+          helm lint helm-charts/standard-service \
+            --set app.name=test-svc \
+            --set app.image=idp/test-svc:v1.0.0 \
+            --set platform.ecrRegistry=1234.dkr.ecr.us-west-2.amazonaws.com \
+            --set ingress.enabled=true \
+            --set ingress.wafEnabled=false
+
+      - name: Run chart unit tests
+        run: helm unittest --strict helm-charts/standard-service

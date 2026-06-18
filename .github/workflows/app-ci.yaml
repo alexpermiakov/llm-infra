@@ -1,0 +1,165 @@
+# Manual deploy: bump apps/<name>/VERSION, then trigger this workflow
+
+name: App CI — Build and Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "App to build (e.g. order-service)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+  security-events: write
+  actions: read
+
+env:
+  AWS_REGION: us-west-2
+  APP: ${{ inputs.app_name }}
+
+jobs:
+  # ── Lint & test ─────────────────────────────────────────────────────
+  quality-gate:
+    name: "Quality — ${{ inputs.app_name }}"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: apps/${{ inputs.app_name }}/go.mod
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: apps/${{ inputs.app_name }}
+
+      - name: Test
+        working-directory: apps/${{ inputs.app_name }}
+        run: go test -v -race -covermode=atomic ./...
+
+  # ── Build, push, scan, sign ─────────────────────────────────────────
+  build-and-push:
+    name: "Build — ${{ inputs.app_name }}"
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read Version
+        id: version
+        run: |
+          VERSION="v$(cat apps/$APP/VERSION | tr -d '[:space:]')"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building $APP $VERSION"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.TOOLING_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          FULL_IMAGE=$ECR_REGISTRY/idp/$APP:$VERSION
+
+          docker build \
+            --build-arg VERSION=$VERSION \
+            --build-arg COMMIT=${{ github.sha }} \
+            -f apps/$APP/Dockerfile \
+            -t $FULL_IMAGE \
+            apps/$APP
+
+          docker push $FULL_IMAGE
+          echo "full_image=$FULL_IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Scan Image
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          image-ref: ${{ steps.build.outputs.full_image }}
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL"
+
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          image-ref: ${{ steps.build.outputs.full_image }}
+          format: "cyclonedx"
+          output: "sbom.json"
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ inputs.app_name }}-${{ steps.version.outputs.version }}
+          path: sbom.json
+          retention-days: 90
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign Image
+        env:
+          FULL_IMAGE: ${{ steps.build.outputs.full_image }}
+        run: |
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $FULL_IMAGE)
+          cosign sign --yes "$DIGEST"
+
+      - name: Attach SBOM Attestation
+        env:
+          FULL_IMAGE: ${{ steps.build.outputs.full_image }}
+        run: |
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $FULL_IMAGE)
+          cosign attest --yes --type cyclonedx --predicate sbom.json "$DIGEST"
+
+  # ── Update GitOps ───────────────────────────────────────────────────
+  update-gitops:
+    name: Update Dev Deployment
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Dev Values
+        id: update
+        run: |
+          VERSION="v$(cat apps/$APP/VERSION | tr -d '[:space:]')"
+          DEV_FILE="argocd/applications/dev/values/${APP}.yaml"
+
+          if [ -f "$DEV_FILE" ]; then
+            sed -i "s|image: idp/${APP}:.*|image: idp/${APP}:${VERSION}|g" "$DEV_FILE"
+            echo "Updated $DEV_FILE → $VERSION"
+          else
+            echo "Warning: $DEV_FILE not found, skipping"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Commit and Push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.update.outputs.version }}
+        run: |
+          git config user.name "Platform Bot"
+          git config user.email "bot@platform.internal"
+          git add argocd/
+          git commit -m "chore: deploy $APP $VERSION to dev" || exit 0
+          git push origin HEAD
+

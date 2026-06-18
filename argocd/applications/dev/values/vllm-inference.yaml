@@ -1,0 +1,76 @@
+# vLLM inference server serving the OpenAI-compatible API.
+# Current PoC model is facebook/opt-125m; swap explicitly if you want a larger model.
+
+app:
+  name: vllm-inference
+  image: vllm/vllm-openai:v0.8.3
+  externalImage: true
+  port: 8000
+
+podAnnotations: {}
+
+resourceProfile: gpu
+replicaCount: 1
+
+args:
+  - "--model"
+  - "facebook/opt-125m"
+  - "--port"
+  - "8000"
+  - "--max-model-len"
+  - "2048"
+
+nodeSelector:
+  karpenter.sh/nodepool: gpu
+
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+
+sharedMemory:
+  enabled: true
+  sizeLimit: 8Gi
+
+securityContext:
+  runAsNonRoot: false
+  runAsUser: 0
+  fsGroup: 0
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+healthCheck:
+  liveness:
+    path: /health
+    initialDelaySeconds: 120
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 5
+  readiness:
+    path: /health
+    initialDelaySeconds: 90
+    periodSeconds: 10
+    timeoutSeconds: 10
+    failureThreshold: 5
+
+autoscaling:
+  minReplicas: 1
+  maxReplicas: 1
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+
+ingress:
+  enabled: false
+
+rollout:
+  strategy: blueGreen
+  prePromotionAnalysis: false
+
+cilium:
+  allowSameNamespace: true
+  allowFromNamespaces:
+    - llm-client
+

@@ -1,0 +1,64 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyLeavingOrganization",
+      "Effect": "Deny",
+      "Action": ["organizations:LeaveOrganization"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyDeletingKMSKeys",
+      "Effect": "Deny",
+      "Action": ["kms:ScheduleKeyDeletion", "kms:DeleteImportedKeyMaterial"],
+      "Resource": "*",
+      "Condition": {
+        "StringNotLike": {
+          "aws:PrincipalArn": [
+            "arn:aws:iam::*:role/OrganizationAccountAccessRole",
+            "arn:aws:iam::*:role/AWSControlTowerExecution"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyDisablingEBSEncryptionByDefault",
+      "Effect": "Deny",
+      "Action": "ec2:DisableEbsEncryptionByDefault",
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyDeletingFlowLogs",
+      "Effect": "Deny",
+      "Action": "ec2:DeleteFlowLogs",
+      "Resource": "*",
+      "Condition": {
+        "StringNotLike": {
+          "aws:PrincipalArn": [
+            "arn:aws:iam::*:role/OrganizationAccountAccessRole",
+            "arn:aws:iam::*:role/AWSControlTowerExecution"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "DenyModifyingBackupVaultAccessPolicy",
+      "Effect": "Deny",
+      "Action": [
+        "backup:DeleteBackupVaultAccessPolicy",
+        "backup:PutBackupVaultAccessPolicy",
+        "backup:DeleteBackupVaultLockConfiguration"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotLike": {
+          "aws:PrincipalArn": [
+            "arn:aws:iam::*:role/OrganizationAccountAccessRole",
+            "arn:aws:iam::*:role/AWSControlTowerExecution"
+          ]
+        }
+      }
+    }
+  ]
+}
+

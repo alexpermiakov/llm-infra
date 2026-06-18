@@ -1,0 +1,60 @@
+name: Destroy Staging
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-west-2
+  BUCKET_NAME: terraform-state-alexidp-staging
+  TF_VAR_pr_number: 0
+  TF_VAR_environment: staging
+
+jobs:
+  destroy:
+    name: Destroy Staging
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.3
+          terraform_wrapper: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.1
+        id: oidc
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Terraform Init (Prepare for Destroy)
+        working-directory: infra/entry
+        run: |
+          terraform init \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="bucket=${{ env.BUCKET_NAME }}" \
+            -backend-config="key=staging/state.tfstate" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform Destroy
+        working-directory: infra/entry
+        run: terraform destroy -auto-approve
+
+      - name: Delete Terraform State from S3
+        working-directory: infra/entry
+        run: |
+          BUCKET=${{ env.BUCKET_NAME }}
+          PREFIX="staging"
+
+          echo "Deleting Terraform state from S3: s3://$BUCKET/$PREFIX/"
+          aws s3 rm "s3://$BUCKET/$PREFIX/" --recursive
+          echo "Terraform state cleanup completed for staging"
+

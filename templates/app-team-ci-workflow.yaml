@@ -1,0 +1,289 @@
+# GitHub Actions Workflow Template for App Teams
+# Place this file in your app repo at: .github/workflows/ci.yaml
+#
+# Prerequisites:
+# 1. GitHub token with write access to platform repo (stored as secret: PLATFORM_REPO_TOKEN)
+# 2. Configure the variables below for your service
+
+name: CI - Build and Deploy to IDP
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+  actions: read
+
+env:
+  SERVICE_NAME: my-service
+  ECR_REPOSITORY: idp/my-service
+  AWS_REGION: us-west-2
+  PLATFORM_REPO: alexpermiakov/paved-road-platform
+
+jobs:
+  quality-gate:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Run Linter
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+      - name: Run Tests
+        run: go test -v -race -covermode=atomic ./...
+
+      - name: Placeholder Quality Check
+        run: echo "Configure language-specific quality checks above"
+
+  build-and-push:
+    name: Containerize and Publish
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    # Only build on main branch or tags
+    if: github.event_name != 'pull_request'
+    outputs:
+      image_tag: ${{ steps.prep.outputs.tag }}
+      full_image: ${{ steps.build.outputs.full_image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare Metadata
+        id: prep
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+          else
+            TAG=sha-${GITHUB_SHA::7}
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag, and Push
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.prep.outputs.tag }}
+        run: |
+          FULL_IMAGE=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+          docker build \
+            --build-arg VERSION=$IMAGE_TAG \
+            --build-arg COMMIT=${{ github.sha }} \
+            --build-arg BUILD_TIME=${{ steps.prep.outputs.build_date }} \
+            -t $FULL_IMAGE .
+
+          docker push $FULL_IMAGE
+
+          echo "full_image=$FULL_IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Scan Image for Vulnerabilities
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ${{ steps.build.outputs.full_image }}
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL"
+
+      # Supply Chain Security: Generate SBOM (Software Bill of Materials)
+      # Required for: FDA, SOC 2 CC7.1, US Executive Order 14028
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ${{ steps.build.outputs.full_image }}
+          format: "cyclonedx"
+          output: "sbom.json"
+
+      - name: Upload SBOM as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ steps.prep.outputs.tag }}
+          path: sbom.json
+          retention-days: 90
+
+      # Supply Chain Security: Sign Image with Cosign (Keyless)
+      # Required for: PCI-DSS 6.3, FDA 21 CFR Part 11, SOC 2 CC8.1
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign Image with Cosign (Keyless)
+        env:
+          FULL_IMAGE: ${{ steps.build.outputs.full_image }}
+        run: |
+          # Get the image digest for signing (more secure than tag)
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $FULL_IMAGE)
+
+          # Sign the image using GitHub OIDC identity (keyless)
+          # This creates a signature proving:
+          # - Image was signed by GitHub Actions
+          # - From this specific repo/workflow/branch
+          # - At this specific commit
+          cosign sign --yes "$DIGEST"
+
+          echo "✅ Image signed: $DIGEST"
+
+      - name: Attach SBOM Attestation to Image
+        env:
+          FULL_IMAGE: ${{ steps.build.outputs.full_image }}
+        run: |
+          # Get the image digest
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $FULL_IMAGE)
+
+          # Attach SBOM as an attestation (signed and linked to image)
+          cosign attest --yes --type cyclonedx --predicate sbom.json "$DIGEST"
+
+          echo "✅ SBOM attestation attached to: $DIGEST"
+
+  update-gitops:
+    name: Update Platform Repository
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    # Only create PR for version tags
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Extract Version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Clone Platform Repository
+        env:
+          GITHUB_TOKEN: ${{ secrets.PLATFORM_REPO_TOKEN }}
+        run: |
+          git clone https://x-access-token:${GITHUB_TOKEN}@github.com/${{ env.PLATFORM_REPO }}.git platform-repo
+
+      - name: Update Deployment Manifest
+        working-directory: platform-repo
+        env:
+          SERVICE_NAME: ${{ env.SERVICE_NAME }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          VERSION: ${{ steps.version.outputs.version }}
+          FULL_IMAGE: ${{ needs.build-and-push.outputs.full_image }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          # Configure git
+          git config user.name "App Team Bot"
+          git config user.email "bot@example.com"
+
+          # Create branch
+          BRANCH_NAME="deploy-${SERVICE_NAME}-${VERSION}"
+          git checkout -b $BRANCH_NAME
+
+          # Update dev environment
+          DEV_FILE="argocd/applications/dev/${SERVICE_NAME}.yaml"
+
+          if [ ! -f "$DEV_FILE" ]; then
+            echo "Error: $DEV_FILE not found!"
+            exit 1
+          fi
+
+          # Update image tag in the manifest
+          # Adjust this sed command based on your manifest structure
+          sed -i "s|image: .*/${ECR_REPOSITORY}:.*|image: ${FULL_IMAGE}|g" "$DEV_FILE"
+
+          # Commit changes
+          git add "$DEV_FILE"
+
+          COMMIT_MSG=$(cat <<EOF
+          chore: deploy ${SERVICE_NAME} ${VERSION} to dev
+
+          Automated deployment request from app team.
+
+          - Service: ${SERVICE_NAME}
+          - Version: ${VERSION}
+          - Image: ${FULL_IMAGE}
+          - Triggered by: ${GITHUB_ACTOR}
+          - Commit: ${GITHUB_SHA:0:7}
+          EOF
+          )
+
+          git commit -m "$COMMIT_MSG"
+          git push origin $BRANCH_NAME
+
+      - name: Create Pull Request
+        working-directory: platform-repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.PLATFORM_REPO_TOKEN }}
+          SERVICE_NAME: ${{ env.SERVICE_NAME }}
+          VERSION: ${{ steps.version.outputs.version }}
+          FULL_IMAGE: ${{ needs.build-and-push.outputs.full_image }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          PLATFORM_REPO: ${{ env.PLATFORM_REPO }}
+        run: |
+          BRANCH_NAME="deploy-${SERVICE_NAME}-${VERSION}"
+
+          PR_BODY=$(cat <<EOF
+          ## Deployment Request
+
+          **Service:** ${SERVICE_NAME}  
+          **Version:** ${VERSION}  
+          **Image:** \`${FULL_IMAGE}\`  
+          **Requested by:** @${GITHUB_ACTOR}
+
+          ### Changes
+          - Updates dev environment to version ${VERSION}
+          - Docker image has been built and pushed to ECR
+
+          ### Verification
+          - ✅ Quality gate passed (linting, tests)
+          - ✅ Image built and pushed to ECR
+          - ✅ Manifest updated in dev environment
+
+          ### Checklist for Reviewers
+          - [ ] Image exists in ECR
+          - [ ] Version tag is valid semver
+          - [ ] Manifest changes look correct
+          - [ ] Ready to deploy to dev
+
+          ---
+          *This PR was automatically created by the app team's CI/CD pipeline.*
+          EOF
+          )
+
+          gh pr create \
+            --title "🚀 Deploy ${SERVICE_NAME} ${VERSION} to dev" \
+            --body "$PR_BODY" \
+            --base main \
+            --head $BRANCH_NAME \
+            --repo $PLATFORM_REPO
+
+      - name: Deployment Summary
+        run: |
+          echo "### Deployment Initiated ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service:** ${{ env.SERVICE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** \`${{ needs.build-and-push.outputs.full_image }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** dev" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "A PR has been created in the platform repository for review." >> $GITHUB_STEP_SUMMARY
+

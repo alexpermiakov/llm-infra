@@ -1,0 +1,16 @@
+# Order Service Helm Values for Staging Environment
+
+app:
+  name: order-service
+  image: idp/order-service:v1.0.0
+  port: 8080
+
+resourceProfile: medium
+replicaCount: 2
+
+ingress:
+  enabled: true
+  path: /orders
+  annotations:
+    alb.ingress.kubernetes.io/healthcheck-port: "8080"
+

@@ -1,0 +1,60 @@
+suite: standard-service default-deny network policy
+templates:
+  - templates/networkpolicy.yaml
+tests:
+  - it: applies a default-deny posture (both ingress and egress are governed)
+    set:
+      app.name: test-svc
+    asserts:
+      - isKind:
+          of: NetworkPolicy
+      - contains:
+          path: spec.policyTypes
+          content: Ingress
+      - contains:
+          path: spec.policyTypes
+          content: Egress
+
+  - it: permits only DNS and HTTPS egress by default
+    set:
+      app.name: test-svc
+    asserts:
+      # DNS (UDP 53) to kube-system
+      - equal:
+          path: spec.egress[0].ports[0].port
+          value: 53
+      # HTTPS (TCP 443) outbound
+      - equal:
+          path: spec.egress[1].ports[0].port
+          value: 443
+      # Nothing else is allowed out unless explicitly added
+      - lengthEqual:
+          path: spec.egress
+          count: 2
+
+  - it: appends explicit in-cluster egress dependencies when declared
+    set:
+      app.name: test-svc
+      networkPolicy.additionalEgressRules:
+        - to:
+            - namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: vllm-inference
+          ports:
+            - protocol: TCP
+              port: 8000
+    asserts:
+      - lengthEqual:
+          path: spec.egress
+          count: 3
+      - equal:
+          path: spec.egress[2].ports[0].port
+          value: 8000
+
+  - it: emits nothing when network policy is disabled
+    set:
+      app.name: test-svc
+      networkPolicy.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
