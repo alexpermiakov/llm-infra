@@ -14,6 +14,8 @@ A developer pushes a tag in their app repo. CI lints, tests, builds, scans, sign
 > [!NOTE]
 > **What this is.** A working platform deployed to a **real multi-account AWS Organization**, with the full control plane (IaC, CI/CD, GitOps, guardrails, progressive delivery) exercised end-to-end. The AWS environment is real but kept private — I'll walk through it live during the interview. See [Scope & Trade-offs](#-scope--trade-offs) for exactly what's real, what's constrained for this submission, and what I'd do next.
 >
+> Because this repo is public, I've disabled GitHub Actions here and stripped out sensitive details (AWS account IDs, etc.) — but I'm happy to demo it running end-to-end from a separate private repo.
+>
 > This is adapted from a personal project of mine and was built AI-assisted (Claude Code) throughout.
 
 ---
