@@ -57,6 +57,8 @@ The pre-merge gates blocking `provision` on a real pipeline run:
 
 ![Provisioning gates enforced in CI](docs/assets/provision-gates.png)
 
+![Canary probe during a rollout](docs/assets/canary-probe.png)
+
 ---
 
 ## 1 · Unit tests — code & platform logic
