@@ -102,7 +102,7 @@ resource "kubectl_manifest" "slo_rules" {
               annotations = {
                 summary     = "SLO error budget burning fast"
                 description = "Service {{ $labels.namespace }}/{{ $labels.service }} has consumed >50% of error budget. Current success rate: {{ $value | humanizePercentage }}"
-                runbook_url = "https://github.com/alexpermiakov/paved-road/blob/main/docs/runbooks/slo-budget-burn.md"
+                runbook_url = "https://github.com/alexpermiakov/paved-road-platform/blob/main/docs/runbooks/slo-budget-burn.md"
               }
             },
             # Alert: Error budget exhausted
@@ -116,7 +116,7 @@ resource "kubectl_manifest" "slo_rules" {
               annotations = {
                 summary     = "SLO error budget exhausted"
                 description = "Service {{ $labels.namespace }}/{{ $labels.service }} has exhausted its error budget. Immediate action required."
-                runbook_url = "https://github.com/alexpermiakov/paved-road/blob/main/docs/runbooks/slo-budget-exhausted.md"
+                runbook_url = "https://github.com/alexpermiakov/paved-road-platform/blob/main/docs/runbooks/slo-budget-exhausted.md"
               }
             }
           ]
@@ -149,7 +149,7 @@ resource "kubectl_manifest" "slo_rules" {
               annotations = {
                 summary     = "P99 latency exceeding SLO target"
                 description = "Service {{ $labels.namespace }}/{{ $labels.service }} P99 latency is {{ $value | humanizeDuration }}, exceeding 500ms target."
-                runbook_url = "https://github.com/alexpermiakov/paved-road/blob/main/docs/runbooks/high-latency.md"
+                runbook_url = "https://github.com/alexpermiakov/paved-road-platform/blob/main/docs/runbooks/high-latency.md"
               }
             }
           ]
@@ -168,7 +168,7 @@ resource "kubectl_manifest" "slo_rules" {
               annotations = {
                 summary     = "Pod restarting frequently"
                 description = "Pod {{ $labels.namespace }}/{{ $labels.pod }} has restarted {{ $value | humanize }} times in the last 15 minutes."
-                runbook_url = "https://github.com/alexpermiakov/paved-road/blob/main/docs/runbooks/pod-crash-loop.md"
+                runbook_url = "https://github.com/alexpermiakov/paved-road-platform/blob/main/docs/runbooks/pod-crash-loop.md"
               }
             },
             # Node not ready
@@ -182,7 +182,7 @@ resource "kubectl_manifest" "slo_rules" {
               annotations = {
                 summary     = "Kubernetes node not ready"
                 description = "Node {{ $labels.node }} has been not ready for more than 5 minutes."
-                runbook_url = "https://github.com/alexpermiakov/paved-road/blob/main/docs/runbooks/node-not-ready.md"
+                runbook_url = "https://github.com/alexpermiakov/paved-road-platform/blob/main/docs/runbooks/node-not-ready.md"
               }
             },
             # PVC nearly full
@@ -200,7 +200,7 @@ resource "kubectl_manifest" "slo_rules" {
               annotations = {
                 summary     = "Persistent volume nearly full"
                 description = "PVC {{ $labels.persistentvolumeclaim }} in namespace {{ $labels.namespace }} is {{ $value | humanizePercentage }} full."
-                runbook_url = "https://github.com/alexpermiakov/paved-road/blob/main/docs/runbooks/pvc-full.md"
+                runbook_url = "https://github.com/alexpermiakov/paved-road-platform/blob/main/docs/runbooks/pvc-full.md"
               }
             }
           ]

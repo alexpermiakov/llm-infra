@@ -25,7 +25,7 @@ env:
   SERVICE_NAME: my-service
   ECR_REPOSITORY: idp/my-service
   AWS_REGION: us-west-2
-  PLATFORM_REPO: alexpermiakov/paved-road
+  PLATFORM_REPO: alexpermiakov/paved-road-platform
 
 jobs:
   quality-gate:

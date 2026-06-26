@@ -263,7 +263,7 @@ spec:
   goTemplateOptions: ["missingkey=error"]
   generators:
     - git:
-        repoURL: https://github.com/alexpermiakov/paved-road
+        repoURL: https://github.com/alexpermiakov/paved-road-platform
         revision: $TARGET_REVISION
         files:
           - path: "argocd/applications/${var.environment}/values/*.yaml"
@@ -273,7 +273,7 @@ spec:
     spec:
       project: default
       source:
-        repoURL: https://github.com/alexpermiakov/paved-road
+        repoURL: https://github.com/alexpermiakov/paved-road-platform
         targetRevision: $TARGET_REVISION
         path: helm-charts/standard-service
         plugin:
