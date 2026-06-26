@@ -55,7 +55,11 @@ The first three are **pre-merge gates wired into [`provision-dev`](.github/workf
 
 The pre-merge gates blocking `provision` on a real pipeline run:
 
+**Pre-merge gates enforced in CI**
+
 ![Provisioning gates enforced in CI](docs/assets/provision-gates.png)
+
+**Canary probe during a rollout**
 
 ![Canary probe during a rollout](docs/assets/canary-probe.png)
 
