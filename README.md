@@ -8,11 +8,13 @@
 ![Argo Rollouts](https://img.shields.io/badge/Delivery-Argo%20Rollouts-EF7B4D?logo=argo&logoColor=white)
 ![Cilium](https://img.shields.io/badge/Network-Cilium%20eBPF-F8C517?logo=cilium&logoColor=black)
 ![Go](https://img.shields.io/badge/Apps-Go-00ADD8?logo=go&logoColor=white)
+![Platform Tests](https://github.com/alexpermiakov/paved-road-platform/actions/workflows/platform-tests.yaml/badge.svg)
+![App CI](https://github.com/alexpermiakov/paved-road-platform/actions/workflows/app-ci.yaml/badge.svg)
 
 A developer pushes a tag in their app repo. CI lints, tests, builds, scans, signs, and opens a GitOps PR against this platform repo. Argo CD picks up the merge and rolls the new version out **progressively** — canary or blue-green — behind WAF, network policies, and admission control. The developer never writes Kubernetes YAML, touches Terraform, or files a ticket.
 
 > [!NOTE]
-> **What this is.** A working platform deployed to a **real multi-account AWS Organization**, with the full control plane (IaC, CI/CD, GitOps, guardrails, progressive delivery) exercised end-to-end. The AWS environment is real but kept private — I'll walk through it live during the interview. See [Scope & Trade-offs](#-scope--trade-offs) for exactly what's real, what's constrained for this submission, and what I'd do next.
+> **What this is.** A working platform deployed to a **real multi-account AWS Organization**, with the full control plane (IaC, CI/CD, GitOps, guardrails, progressive delivery) exercised end-to-end. The AWS environment is real but kept private — see [Scope & Trade-offs](#-scope--trade-offs) for exactly what's real, what's constrained, and what I'd do next. Happy to walk through the running platform live.
 >
 > This is adapted from a personal project of mine and was built AI-assisted (Claude Code) throughout.
 
@@ -68,17 +70,26 @@ Three services ride the paved road, chosen to exercise different parts of it:
 
 ## 🧰 What you get
 
+**Platform & Delivery**
+
 | Category | What's included |
 | --- | --- |
 | **Multi-account AWS** | AWS Organization with separate **tooling / dev / staging / prod** accounts; ECR lives in tooling and is pulled cross-account; SCPs guardrail every account. |
 | **Progressive delivery** | Argo Rollouts with **canary** (5→20→50→80% with pauses) and **blue-green** (preview service + scale-down delay); optional Prometheus analysis to auto-abort. |
 | **GitOps** | Argo CD per cluster, Helm-based deploys, PR-driven environments — `main`→staging, semver tag→prod, PR branch→ephemeral dev. |
 | **Golden path Helm chart** | One `standard-service` chart gives every app a Rollout, Service, HPA, PDB, NetworkPolicy + CiliumNetworkPolicy, ServiceAccount/IRSA, and ingress from a handful of values. |
-| **Security & supply chain** | WAF (OWASP), Cilium WireGuard mTLS + L7 policy, Kyverno admission control, Falco runtime detection, Trivy scanning, Cosign signing, SBOM attestation. |
-| **Compliance controls** | KMS everywhere, CloudTrail→S3 (WORM), GuardDuty, Security Hub, Macie PII/PHI scanning, AWS Config rules — mapped to PCI-DSS / HIPAA / SOC 2. |
 | **Observability** | Prometheus, Grafana, Loki, SLO dashboards, Hubble flow telemetry, Kubecost. |
 | **Cost control** | Karpenter spot instances, scale-to-near-zero when idle. |
 | **DR (scaffolded)** | Active-passive multi-region with Route 53 failover — **second region is disabled for now**; see below. |
+
+**Security & Compliance**
+
+| Category | What's included |
+| --- | --- |
+| **Network security** | Cilium WireGuard mTLS + L7 policy, WAF (OWASP top-10 ruleset), default-deny NetworkPolicy enforced at admission. |
+| **Runtime guardrails** | Kyverno admission control (policy-as-code), Falco runtime threat detection. |
+| **Supply chain** | Trivy image scanning (blocks on `CRITICAL`), Cosign signing, CycloneDX SBOM attestation. |
+| **Compliance controls** | KMS everywhere, CloudTrail→S3 (WORM), GuardDuty, Security Hub, Macie PII/PHI scanning, AWS Config rules — mapped to PCI-DSS / HIPAA / SOC 2. |
 
 ---
 
@@ -112,7 +123,7 @@ What I deliberately built, what's constrained for this submission, and what I le
 - 🧪 **Tests for the platform itself** — `helm unittest` suites cover the golden-path chart: canary vs. blue-green rendering, the "canary requires an ingress" guard, the enforced pod security context, and the default-deny network policy. They run on every PR ([`platform-tests.yaml`](.github/workflows/platform-tests.yaml)) and **block the dev cluster from provisioning if they fail** — [`provision-dev.yml`](.github/workflows/provision-dev.yml) `needs:` them before any Terraform runs.
 
 **Constrained for this submission**
-- The AWS environment is **real but private**: I'm not handing over live accounts or credentials for reviewers to run themselves. I'll walk through the running platform during the interview (see [Proof it runs](#-proof-it-runs)).
+- The AWS environment is **real but private**: credentials are not shared for external review. See [Proof it runs](#-proof-it-runs) for screenshots from the live cluster.
 - **Apps are vendored here** rather than living in their own repos (see note above).
 - **Rollout analysis is configured but disabled** in the sample values — there isn't enough real traffic for the metrics to be meaningful in a demo.
 
@@ -125,7 +136,7 @@ What I deliberately built, what's constrained for this submission, and what I le
 
 ## 📸 Proof it runs
 
-These are from the live, multi-account AWS cluster, capturing the full control plane (Terraform → GitHub Actions → ECR → Argo CD → progressive rollout). **I'm happy to walk through the running platform live during the interview** — the AWS environment is real but kept private.
+These are from the live, multi-account AWS cluster, capturing the full control plane (Terraform → GitHub Actions → ECR → Argo CD → progressive rollout).
 
 **Argo CD — all three services healthy and synced from this repo:**
 
@@ -160,7 +171,8 @@ helm-charts/standard-service/   # The golden-path chart every service uses (+ te
 argocd/applications/       # Argo CD app definitions per environment (dev/staging/prod)
 infra/
   entry/                   # Per-cluster root module (one apply per account/region)
-  modules/                 # VPC, EKS, Cilium, Argo CD, security, compliance, GPU, ...
+  modules/                 # vpc · eks · cilium · argocd · security · compliance
+                           # monitoring · gpu · waf · external-secrets · dns-failover
   tooling/                 # Tooling account (ECR, state)
 policies/
   scp/                     # Org-wide Service Control Policies
@@ -177,8 +189,27 @@ docs/                      # Architecture, runbooks, ADRs, operations
 
 1. Fork this repo and configure GitHub secrets / OIDC roles — see [SETUP.md](SETUP.md).
 2. Create a GitHub App for Argo CD repository access.
-3. Push to trigger GitHub Actions → Terraform provisions the cluster.
-4. Open a PR → an ephemeral dev environment spins up automatically.
+3. Push to `main` → GitHub Actions runs `provision-staging.yml` (Terraform provisions the staging cluster). Push a semver tag (e.g. `v1.0.0`) → triggers `provision-prod.yml`.
+4. Open a PR → `provision-dev.yml` spins up an ephemeral dev environment automatically; it is torn down when the PR is closed.
+
+---
+
+## 🛠️ Troubleshooting
+
+**`terraform apply` fails with `AccessDenied`**
+OIDC trust or the GitHub Actions IAM role is misconfigured. Verify the role trust policy matches your fork's org/repo and that the `sub` condition allows the branch/tag you're pushing. See [SETUP.md](SETUP.md).
+
+**Argo CD shows `ComparisonError` or can't clone the repo**
+The GitHub App credential (bootstrap secret in External Secrets) is likely missing or expired. Re-run the secret rotation runbook in [docs/runbooks/](docs/runbooks/).
+
+**Argo Rollouts canary stuck at a step and never progresses**
+If analysis is enabled but Prometheus has no data (common in dev), the analysis template will time out and pause the rollout. Either disable analysis in `values.yaml` or promote manually with `kubectl argo rollouts promote <name>`.
+
+**`helm unittest` fails locally but passes in CI**
+Ensure your local `helm` version matches the one pinned in `platform-tests.yaml`. Install the unittest plugin: `helm plugin install https://github.com/helm-unittest/helm-unittest`.
+
+**Kyverno blocks a pod with `policy violation`**
+Run `kubectl describe policyreport -n <namespace>` to see the failing rule. Most violations are missing `runAsNonRoot` or `readOnlyRootFilesystem` — these are enforced by the `standard-service` chart by default; check that your values don't override the pod security context.
 
 ---
 
@@ -196,9 +227,10 @@ docs/                      # Architecture, runbooks, ADRs, operations
 
 ## 🧱 Tech stack
 
-- **AWS** — EKS · Karpenter · WAF · GuardDuty · Security Hub · Macie · Inspector · CloudTrail · KMS · Config
-- **Kubernetes** — Cilium · Argo CD · Argo Rollouts · Kyverno · Falco · Velero · External Secrets
-- **Observability** — Prometheus · Grafana · Loki · Hubble · Kubecost
-- **AI/ML** — vLLM · GPU node pools (g5/g6) · NVIDIA device plugin
-- **Supply chain** — Trivy · Cosign · CycloneDX SBOM
-- **IaC & CI** — Terraform (modular) · GitHub Actions (OIDC)
+`AWS EKS` · `Karpenter` · `WAF` · `GuardDuty` · `Security Hub` · `Macie` · `CloudTrail` · `KMS` · `Config` · `Cilium` · `Argo CD` · `Argo Rollouts` · `Kyverno` · `Falco` · `Velero` · `External Secrets` · `Prometheus` · `Grafana` · `Loki` · `Hubble` · `Kubecost` · `vLLM` · `Trivy` · `Cosign` · `CycloneDX` · `Terraform` · `GitHub Actions`
+
+---
+
+## 📄 License
+
+MIT
