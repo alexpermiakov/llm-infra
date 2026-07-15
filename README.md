@@ -1,3 +1,5 @@
+![LLM Inference Platform on EKS — from git tag to GPU](docs/assets/social-preview.png)
+
 # llm-infra — LLM Inference Platform on Multi-Cluster EKS
 
 > A self-hosted LLM inference platform running on a real multi-account AWS Organization: open-weights models served by **vLLM on Karpenter-provisioned GPU node pools**, inside the VPC so **prompt data never leaves it**, and shipped to production **safely, repeatably, and without talking to the platform team**.
